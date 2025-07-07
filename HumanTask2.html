@@ -1,0 +1,196 @@
+<script src="https://assets.crowd.aws/crowd-html-elements.js"></script>
+
+<crowd-form>
+    <crowd-tabs>
+        <crowd-tab header="Subtitle Review" id="tab1">
+            <div>
+                <h3>Instructions</h3>
+                <ul>
+                    <li>Review the video subtitles below for accuracy</li>
+                    <li>Each subtitle block contains:
+                        <ul>
+                            <li>Subtitle number</li>
+                            <li>Timestamp (format: HH:MM:SS,mmm --> HH:MM:SS,mmm)</li>
+                            <li>Text content</li>
+                        </ul>
+                    </li>
+                    <li>Maintain the format while editing:
+                        <pre style="background: #f5f5f5; padding: 10px;">
+1
+00:00:00,000 --> 00:00:03,000
+Sample subtitle text</pre>
+                    </li>
+                    <li>If a section is completely unintelligible, use [inaudible]</li>
+                </ul>
+            </div>
+
+            <div class="video-container">
+                <h3>Original Media</h3>
+                <div class="video-wrapper">
+                    <crowd-video-player controls>
+                        <source src="{{ task.input.mediaUrl }}.mp4" type="video/mp4">
+                        <source src="{{ task.input.mediaUrl }}.webm" type="video/webm">
+                        <source src="{{ task.input.mediaUrl }}.ogg" type="video/ogg">
+                        Your browser does not support the video tag.
+                    </crowd-video-player>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <h3>Subtitle Content</h3>
+                <crowd-text-area
+                    name="subtitles"
+                    rows="15"
+                    value="{{ task.input.subtitles }}"
+                    placeholder="Subtitle content will appear here in SRT format"
+                ></crowd-text-area>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <h3>Quality Assessment</h3>
+                <crowd-radio-group name="quality">
+                    <crowd-radio-button value="high">
+                        High Quality - Minor or no edits needed
+                    </crowd-radio-button>
+                    <crowd-radio-button value="medium">
+                        Medium Quality - Some edits required
+                    </crowd-radio-button>
+                    <crowd-radio-button value="low">
+                        Low Quality - Significant edits needed
+                    </crowd-radio-button>
+                </crowd-radio-group>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <h3>Notes</h3>
+                <crowd-text-area
+                    name="notes"
+                    placeholder="Add any notes about the subtitles or your edits here..."
+                    rows="3"
+                ></crowd-text-area>
+            </div>
+        </crowd-tab>
+        <crowd-tab header="Detailed Instructions" id="tab2">
+            <div style="margin: 20px;">
+                <h2>Detailed Subtitle Review Instructions</h2>
+                
+                <h3>1. Subtitle Format</h3>
+                <ul>
+                    <li>Each subtitle entry consists of three parts:
+                        <ol>
+                            <li>Subtitle number (sequential)</li>
+                            <li>Timestamp (00:00:00,000 --> 00:00:00,000)</li>
+                            <li>Text content (one or more lines)</li>
+                        </ol>
+                    </li>
+                    <li>Leave a blank line between subtitle entries</li>
+                    <li>Don't modify timestamp format</li>
+                </ul>
+
+                <h3>2. Text Guidelines</h3>
+                <ul>
+                    <li>Maximum 2 lines per subtitle</li>
+                    <li>Maximum 32 characters per line</li>
+                    <li>Minimum duration: 1 second</li>
+                    <li>Maximum duration: 7 seconds</li>
+                    <li>Use proper capitalization and punctuation</li>
+                </ul>
+
+                <h3>3. Common Issues to Watch For</h3>
+                <ul>
+                    <li>Timing misalignment with speech</li>
+                    <li>Line breaks in inappropriate places</li>
+                    <li>Overlapping timestamps</li>
+                    <li>Missing speaker identification if needed</li>
+                    <li>Technical terms and proper nouns</li>
+                </ul>
+
+                <h3>4. Quality Ratings Explained</h3>
+                <ul>
+                    <li><strong>High Quality:</strong> 
+                        <ul>
+                            <li>Accurate transcription</li>
+                            <li>Proper timing</li>
+                            <li>Correct formatting</li>
+                            <li>Only minor adjustments needed</li>
+                        </ul>
+                    </li>
+                    <li><strong>Medium Quality:</strong>
+                        <ul>
+                            <li>Some timing issues</li>
+                            <li>Some formatting problems</li>
+                            <li>Multiple text corrections needed</li>
+                        </ul>
+                    </li>
+                    <li><strong>Low Quality:</strong>
+                        <ul>
+                            <li>Major timing problems</li>
+                            <li>Significant text errors</li>
+                            <li>Poor formatting</li>
+                            <li>Requires extensive editing</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+        </crowd-tab>
+    </crowd-tabs>
+</crowd-form>
+
+<style>
+    crowd-form {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+
+    h3 {
+        color: #232f3e;
+        margin-top: 20px;
+    }
+
+    ul {
+        margin-bottom: 20px;
+    }
+
+    crowd-text-area {
+        width: 100%;
+        font-family: monospace;
+    }
+
+    crowd-radio-group {
+        margin: 10px 0;
+    }
+
+    crowd-radio-button {
+        display: block;
+        margin: 5px 0;
+    }
+
+    pre {
+        font-family: monospace;
+        white-space: pre-wrap;
+    }
+
+    .video-container {
+        max-width: 800px;
+        margin: 20px auto;
+        background: #f5f5f5;
+        padding: 10px;
+        border-radius: 4px;
+    }
+
+    .video-wrapper {
+        position: relative;
+        padding-bottom: 56.25%; /* 16:9 aspect ratio */
+        height: 0;
+        overflow: hidden;
+    }
+
+    crowd-video-player {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+    }
+</style>

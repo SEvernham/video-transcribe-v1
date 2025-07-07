@@ -1,0 +1,1575 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A2I Video Transcription Workflow with AWS Translate (Single Template)
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Environment name - will be used in S3 bucket names (lowercase only)
+    AllowedPattern: ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
+    ConstraintDescription: Must be between 3 and 63 characters long, contain only
+      lowercase letters, numbers, and hyphens, and not begin or end with a
+      hyphen
+
+  WorkteamArn:
+    Type: String
+    Description: The ARN of the A2I workteam (e.g.,
+      arn:aws:sagemaker:REGION:ACCOUNT:workteam/private-crowd/TEAM-NAME)
+
+  HumanTaskUiArn:
+    Type: String
+    Description: The ARN of the A2I human task UI (e.g.,
+      arn:aws:sagemaker:REGION:ACCOUNT:human-task-ui/UI-NAME)
+
+  LabelingPortalURL:
+    Type: String
+    Description: URL for the A2I Labeling portal
+
+  NotificationTopicArn:
+    Type: String
+    Description: ARN of the SNS Topic for workflow notifications
+
+  ConfidenceThreshold:
+    Type: Number
+    Description: Confidence threshold for human review (0.0-1.0)
+    Default: 0.95
+    MinValue: 0.0
+    MaxValue: 1.0
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Amazon A2I Configuration
+        Parameters:
+          - WorkteamArn
+          - HumanTaskUiArn
+          - LabelingPortalURL
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - EnvironmentName
+          - NotificationTopicArn
+          - ConfidenceThreshold
+
+Resources:
+  # S3 Buckets
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-input-bucket
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-output-bucket
+
+  # IAM Roles
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+                - sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                  - lambda:InvokeFunction
+                  - sagemaker:CreateHumanLoop
+                  - sagemaker:DescribeHumanLoop
+                  - sagemaker:StopHumanLoop
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${InputBucket}/*
+                  - !Sub arn:aws:s3:::${OutputBucket}/*
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                  - sagemaker-a2i-runtime:StartHumanLoop
+                  - sagemaker-a2i-runtime:DescribeHumanLoop
+                  - sagemaker:CreateFlowDefinition
+                  - sagemaker:DeleteFlowDefinition
+                  - sagemaker:StartHumanLoop
+                  - sagemaker:DescribeHumanLoop
+                  - sagemaker:StopHumanLoop
+                  - sagemaker:ListHumanLoops
+                  - sagemaker:ListHumanLoopLabels
+                  - sagemaker:DescribeFlowDefinition
+                  - sagemaker:UpdateFlowDefinition
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - iam:PassRole
+                  - states:StartExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopicArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutBucketNotification
+                  - s3:ListBucket
+                  - s3:CopyObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjects
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub ${InputBucket.Arn}/*
+                  - !Sub ${OutputBucket.Arn}/*
+        - PolicyName: TranslatePermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - translate:TranslateText
+                Resource: '*'
+        - PolicyName: EventBridgePermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource:
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*
+        - PolicyName: StepFunctionsPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                Resource: '*'
+
+  # Lambda Functions
+  StartTranscribeJobLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-start-transcribe-job
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from datetime import datetime, UTC
+          from pathlib import Path
+
+          def get_media_format(key: str) -> str:
+              extension = Path(key).suffix.lower()
+              VIDEO_FORMATS: Dict[str, str] = {
+                  '.mp4': 'mp4',
+                  '.mov': 'mov',
+                  '.m4a': 'm4a',
+                  '.webm': 'webm'
+              }
+              if extension in VIDEO_FORMATS:
+                  return VIDEO_FORMATS[extension]
+              supported_formats = ', '.join(VIDEO_FORMATS.keys())
+              raise ValueError(f"Unsupported media format: {extension}. Supported video formats are: {supported_formats}")
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, str]:
+              try:
+                  transcribe = boto3.client('transcribe')
+                  sns = boto3.client('sns')
+
+                  input_bucket = event['detail']['bucket']['name']
+                  object_key = event['detail']['object']['key']
+                  media_uri = f"s3://{input_bucket}/{object_key}"
+
+                  media_format = get_media_format(object_key)
+                  print(f"Detected media format: {media_format} for file: {object_key}")
+
+                  response = transcribe.start_transcription_job(
+                      TranscriptionJobName=f"TranscriptionJob-{event['executionName']}",
+                      LanguageCode='en-US',
+                      MediaFormat=media_format,
+                      Media={'MediaFileUri': media_uri},
+                      OutputBucketName=event['outputBucket'],
+                      OutputKey=f"{event['executionName']}.json",
+                      Subtitles={
+                          'Formats': ['srt', 'vtt'],
+                          'OutputStartIndex': 1
+                      }
+                  )
+
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Transcription Job Started - {object_key}",
+                      Message=json.dumps({
+                          'status': 'started',
+                          'mediaFile': object_key,
+                          'transcriptionJob': response['TranscriptionJob']['TranscriptionJobName'],
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+
+                  return {
+                      'TranscriptionJobName': response['TranscriptionJob']['TranscriptionJobName']
+                  }
+              except Exception as e:
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Transcription Job Failed - {object_key}",
+                      Message=json.dumps({
+                          'status': 'error',
+                          'mediaFile': object_key,
+                          'error': str(e),
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+                  raise
+      Runtime: python3.11
+      Timeout: 300
+
+  CheckTranscriptionStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-check-transcription-status
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from datetime import datetime, UTC
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, str]:
+              transcribe = boto3.client('transcribe')
+              sns = boto3.client('sns')
+
+              try:
+                  response = transcribe.get_transcription_job(
+                      TranscriptionJobName=event['TranscriptionJobName']
+                  )
+
+                  status = response['TranscriptionJob']['TranscriptionJobStatus']
+
+                  if status == 'COMPLETED':
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f"Transcription Job Completed - {event['TranscriptionJobName']}",
+                          Message=json.dumps({
+                              'status': 'completed',
+                              'transcriptionJob': event['TranscriptionJobName'],
+                              'timestamp': datetime.now(UTC).isoformat()
+                          })
+                      )
+                  elif status == 'FAILED':
+                      failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown')
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f"Transcription Job Failed - {event['TranscriptionJobName']}",
+                          Message=json.dumps({
+                              'status': 'failed',
+                              'transcriptionJob': event['TranscriptionJobName'],
+                              'failureReason': failure_reason,
+                              'timestamp': datetime.now(UTC).isoformat()
+                          })
+                      )
+
+                  return {
+                      'Status': status
+                  }
+              except ClientError as e:
+                  error_message = e.response['Error']['Message']
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Transcription Status Check Failed - {event['TranscriptionJobName']}",
+                      Message=json.dumps({
+                          'status': 'error',
+                          'transcriptionJob': event['TranscriptionJobName'],
+                          'error': error_message,
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+                  raise
+      Runtime: python3.11
+
+  EvaluateConfidenceScoreLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-evaluate-confidence-score
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import os
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, float]:
+              try:
+                  # Get the confidence threshold from environment variable
+                  confidence_threshold = float(os.environ.get('CONFIDENCE_THRESHOLD', 0.95))
+                  
+                  # For this example, we're returning a fixed confidence score
+                  # In a real implementation, you would analyze the transcription
+                  # and calculate an actual confidence score
+                  
+                  # Return a confidence score that will trigger human review
+                  return {'ConfidenceScore': confidence_threshold - 0.05}
+              except Exception as e:
+                  print(f"Error evaluating confidence: {str(e)}")
+                  raise
+      Runtime: python3.11
+
+  CreateHumanLoopLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-human-loop
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+          LABELING_PORTAL_URL: !Ref LabelingPortalURL
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import uuid
+          import os
+          from datetime import datetime, UTC
+          from botocore.exceptions import ClientError
+
+          def get_transcription_content(s3_client: Any, bucket: str, key: str) -> Dict[str, Any]:
+              try:
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  return json.loads(response['Body'].read().decode('utf-8'))
+              except ClientError as e:
+                  print(f"Error getting transcription content: {str(e)}")
+                  raise
+
+          def get_subtitle_content(s3_client: Any, bucket: str, key: str) -> str:
+              try:
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  return response['Body'].read().decode('utf-8')
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'NoSuchKey':
+                      return "No subtitle file generated"
+                  raise
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, str]:
+              print(f"Received event: {json.dumps(event, indent=2)}")
+
+              a2i = boto3.client('sagemaker-a2i-runtime')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+
+              try:
+                  human_loop_name = f"human-loop-{uuid.uuid4()}"
+
+                  if 'payload' not in event:
+                      raise ValueError("Missing 'payload' in event")
+
+                  output_bucket = event['payload'].get('outputBucket') if isinstance(event['payload'], dict) else None
+                  if not output_bucket:
+                      raise ValueError(f"Invalid or missing output bucket. Event payload: {event['payload']}")
+
+                  execution_name = event.get('executionName')
+                  if not execution_name:
+                      raise ValueError("Missing executionName in event")
+
+                  # Get transcription and subtitle content
+                  transcription_result = get_transcription_content(s3, output_bucket, f"{execution_name}.json")
+                  transcript = transcription_result.get('results', {}).get('transcripts', [{}])[0].get('transcript', '')
+
+                  subtitles = get_subtitle_content(s3, output_bucket, f"{execution_name}.srt")
+
+                  original_media = event['payload'].get('detail', {}).get('object', {}).get('key', '')
+
+                  input_content = {
+                      'executionName': execution_name,
+                      'transcriptionText': transcript,
+                      'subtitles': subtitles,
+                      'inputLocation': f"s3://{event['payload']['detail']['bucket']['name']}/{original_media}",
+                      'taskInstructions': 'Please review and correct the transcription and subtitles as needed.'
+                  }
+
+                  if 'flowDefinitionArn' not in event:
+                      raise ValueError("Missing flowDefinitionArn in event")
+
+                  response = a2i.start_human_loop(
+                      HumanLoopName=human_loop_name,
+                      FlowDefinitionArn=event['flowDefinitionArn'],
+                      HumanLoopInput={
+                          'InputContent': json.dumps(input_content)
+                      }
+                  )
+
+                  # Clean labeling portal URL
+                  labeling_portal_url = os.environ['LABELING_PORTAL_URL']
+                  labeling_portal_url = labeling_portal_url.replace('\"', '').replace("'", '')
+                  labeling_portal_url = labeling_portal_url.rstrip('\"/\\')
+                  labeling_portal_url = labeling_portal_url + ' '
+
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Human Review Task Created - {human_loop_name}",
+                      Message=json.dumps({
+                          'status': 'created',
+                          'humanLoopName': human_loop_name,
+                          'executionName': execution_name,
+                          'timestamp': datetime.now(UTC).isoformat(),
+                          'labelingPortalURL': labeling_portal_url,
+                          'instructions': 'Please sign in to the Labeling portal to review and complete this task.'
+                      })
+                  )
+
+                  return {
+                      'HumanLoopArn': response['HumanLoopArn'],
+                      'HumanLoopName': human_loop_name
+                  }
+
+              except Exception as e:
+                  print(f"Error in handler: {str(e)}")
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Human Review Task Creation Failed",
+                      Message=json.dumps({
+                          'status': 'error',
+                          'executionName': event.get('executionName', 'Unknown'),
+                          'error': str(e),
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+                  raise
+      Runtime: python3.11
+
+  CheckA2ITaskStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-check-a2i-task-status
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from datetime import datetime, UTC
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              a2i = boto3.client('sagemaker-a2i-runtime')
+              sns = boto3.client('sns')
+
+              try:
+                  human_loop_name = event['HumanLoopName']
+
+                  response = a2i.describe_human_loop(
+                      HumanLoopName=human_loop_name
+                  )
+
+                  status = response['HumanLoopStatus']
+                  output_location = response.get('HumanLoopOutput', {}).get('OutputS3Uri')
+
+                  print(f"DEBUG: HumanLoop status: {status}")
+                  print(f"DEBUG: HumanLoop output location: {output_location}")
+
+                  if status == 'Completed':
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f"Human Review Task Completed - {human_loop_name}",
+                          Message=json.dumps({
+                              'status': 'completed',
+                              'humanLoopName': human_loop_name,
+                              'outputLocation': output_location,
+                              'timestamp': datetime.now(UTC).isoformat()
+                          })
+                      )
+                  elif status == 'Failed':
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f"Human Review Task Failed - {human_loop_name}",
+                          Message=json.dumps({
+                              'status': 'failed',
+                              'humanLoopName': human_loop_name,
+                              'failureReason': response.get('FailureReason', 'Unknown'),
+                              'timestamp': datetime.now(UTC).isoformat()
+                          })
+                      )
+
+                  return {
+                      'Status': status,
+                      'OutputLocation': output_location
+                  }
+              except ClientError as e:
+                  error_message = e.response['Error']['Message']
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Human Review Task Status Check Failed - {event['HumanLoopName']}",
+                      Message=json.dumps({
+                          'status': 'error',
+                          'humanLoopName': event['HumanLoopName'],
+                          'error': error_message,
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+                  raise
+      Runtime: python3.11
+
+  WriteFinalOutputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-write-final-output
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              print(f"DEBUG: Received event: {json.dumps(event, indent=2)}")
+
+              s3 = boto3.client('s3')
+
+              try:
+                  execution_name = event.get('executionName')
+                  if not execution_name:
+                      raise ValueError("Missing executionName in event")
+
+                  output_bucket = os.environ['OUTPUT_BUCKET']
+                  print(f"DEBUG: Using output bucket: {output_bucket}")
+
+                  a2i_output_location = event.get('OutputLocation')
+                  if not a2i_output_location:
+                      raise ValueError("Missing OutputLocation in event")
+
+                  print(f"DEBUG: A2I output location: {a2i_output_location}")
+
+                  output_parts = a2i_output_location.replace("s3://", "").split("/")
+                  a2i_bucket = output_parts[0]
+                  a2i_key = "/".join(output_parts[1:])
+
+                  print(f"DEBUG: Getting A2I output from bucket: {a2i_bucket}, key: {a2i_key}")
+
+                  a2i_response = s3.get_object(Bucket=a2i_bucket, Key=a2i_key)
+                  a2i_output = json.loads(a2i_response['Body'].read().decode('utf-8'))
+
+                  print(f"DEBUG: A2I output content: {json.dumps(a2i_output, indent=2)}")
+
+                  if ('humanAnswers' not in a2i_output or
+                      not a2i_output['humanAnswers'] or
+                      'answerContent' not in a2i_output['humanAnswers'][0] or
+                      'subtitles' not in a2i_output['humanAnswers'][0]['answerContent']):
+                      raise ValueError("A2I output does not contain reviewed subtitles")
+
+                  reviewed_subtitles = a2i_output['humanAnswers'][0]['answerContent']['subtitles']
+
+                  print("DEBUG: Retrieved reviewed subtitles content")
+
+                  updated_srt_key = f"{execution_name}_reviewed.srt"
+                  s3.put_object(
+                      Bucket=output_bucket,
+                      Key=updated_srt_key,
+                      Body=reviewed_subtitles
+                  )
+
+                  print(f"DEBUG: Written reviewed SRT file to: {output_bucket}/{updated_srt_key}")
+
+                  return {
+                      'Status': 'Success',
+                      'ExecutionName': execution_name,
+                      'OutputLocation': f"s3://{output_bucket}/{updated_srt_key}"
+                  }
+
+              except ClientError as e:
+                  error_message = f"Error processing SRT: {e.response['Error']['Message']}"
+                  print(f"DEBUG: {error_message}")
+                  raise
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  print(f"DEBUG: {error_message}")
+                  raise
+      Runtime: python3.11
+      Timeout: 300
+      
+  TranslateToSpanishLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-translate-to-spanish
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import re
+          from datetime import datetime, UTC
+          from botocore.exceptions import ClientError
+
+          def parse_srt(srt_content):
+              """Parse SRT content into a list of subtitle blocks"""
+              pattern = r'(\d+)\s+(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\s+(.*?)(?=\n\n|\Z)'
+              matches = re.findall(pattern, srt_content, re.DOTALL)
+              
+              subtitles = []
+              for match in matches:
+                  subtitle_id = match[0]
+                  start_time = match[1]
+                  end_time = match[2]
+                  text = match[3].strip()
+                  
+                  subtitles.append({
+                      'id': subtitle_id,
+                      'start': start_time,
+                      'end': end_time,
+                      'text': text
+                  })
+              
+              return subtitles
+
+          def format_srt(subtitles):
+              """Format subtitles back to SRT format"""
+              srt_content = ""
+              for subtitle in subtitles:
+                  srt_content += f"{subtitle['id']}\n"
+                  srt_content += f"{subtitle['start']} --> {subtitle['end']}\n"
+                  srt_content += f"{subtitle['text']}\n\n"
+              
+              return srt_content
+
+          def handler(event, context):
+              """Translate SRT file from English to Spanish using AWS Translate"""
+              print(f"Received event: {json.dumps(event)}")
+              
+              s3 = boto3.client('s3')
+              translate = boto3.client('translate')
+              sns = boto3.client('sns')
+              
+              try:
+                  # Get the input SRT file location
+                  output_location = event.get('OutputLocation')
+                  if not output_location:
+                      raise ValueError("Missing output location in event")
+                  
+                  # Parse S3 URI
+                  output_parts = output_location.replace("s3://", "").split("/")
+                  source_bucket = output_parts[0]
+                  source_key = "/".join(output_parts[1:])
+                  
+                  # Get the SRT content
+                  response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                  srt_content = response['Body'].read().decode('utf-8')
+                  
+                  # Parse SRT
+                  subtitles = parse_srt(srt_content)
+                  
+                  # Translate each subtitle
+                  translated_subtitles = []
+                  for subtitle in subtitles:
+                      translated_text = translate.translate_text(
+                          Text=subtitle['text'],
+                          SourceLanguageCode='en',
+                          TargetLanguageCode='es'
+                      )['TranslatedText']
+                      
+                      translated_subtitles.append({
+                          'id': subtitle['id'],
+                          'start': subtitle['start'],
+                          'end': subtitle['end'],
+                          'text': translated_text
+                      })
+                  
+                  # Format back to SRT
+                  translated_srt = format_srt(translated_subtitles)
+                  
+                  # Write to S3
+                  output_bucket = os.environ['OUTPUT_BUCKET']
+                  execution_name = event.get('ExecutionName', 'unknown')
+                  spanish_key = f"{execution_name}_spanish.srt"
+                  
+                  s3.put_object(
+                      Bucket=output_bucket,
+                      Key=spanish_key,
+                      Body=translated_srt
+                  )
+                  
+                  # Notify success
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Spanish Translation Completed - {execution_name}",
+                      Message=json.dumps({
+                          'status': 'completed',
+                          'executionName': execution_name,
+                          'timestamp': datetime.now(UTC).isoformat(),
+                          'spanishLocation': f"s3://{output_bucket}/{spanish_key}"
+                      })
+                  )
+                  
+                  return {
+                      'Status': 'Success',
+                      'ExecutionName': execution_name,
+                      'SpanishLocation': f"s3://{output_bucket}/{spanish_key}"
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error translating SRT: {str(e)}"
+                  print(error_message)
+                  
+                  # Notify error
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Spanish Translation Failed",
+                      Message=json.dumps({
+                          'status': 'error',
+                          'error': error_message,
+                          'timestamp': datetime.now(UTC).isoformat()
+                      })
+                  )
+                  raise
+      Runtime: python3.11
+      Timeout: 300
+      
+  CopyReviewedSRTLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-copy-reviewed-srt
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          from pathlib import Path
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              print(f"DEBUG: Received event: {json.dumps(event, indent=2)}")
+
+              s3 = boto3.client('s3')
+
+              try:
+                  # Get locations for both English and Spanish files
+                  english_location = event.get('OutputLocation')
+                  spanish_location = event.get('SpanishLocation')
+
+                  if not english_location:
+                      raise ValueError("Missing OutputLocation in event")
+                  if not spanish_location:
+                      raise ValueError("Missing Spanish translation location in event")
+
+                  original_input = event.get('Records', [{}])[0].get('s3', {})
+                  if not original_input:
+                      raise ValueError("Missing original input file information")
+
+                  original_bucket = original_input.get('bucket', {}).get('name')
+                  original_key = original_input.get('object', {}).get('key')
+
+                  if not original_bucket or not original_key:
+                      raise ValueError("Missing original bucket or key information")
+
+                  print(f"DEBUG: Original file: s3://{original_bucket}/{original_key}")
+
+                  # Copy English SRT
+                  eng_source_parts = english_location.replace("s3://", "").split("/")
+                  eng_source_bucket = eng_source_parts[0]
+                  eng_source_key = "/".join(eng_source_parts[1:])
+
+                  eng_destination_key = str(Path(original_key).with_suffix('.srt'))
+
+                  print(f"DEBUG: Copying English SRT from s3://{eng_source_bucket}/{eng_source_key}")
+                  print(f"DEBUG: Copying to s3://{original_bucket}/{eng_destination_key}")
+
+                  s3.copy_object(
+                      CopySource={
+                          'Bucket': eng_source_bucket,
+                          'Key': eng_source_key
+                      },
+                      Bucket=original_bucket,
+                      Key=eng_destination_key
+                  )
+
+                  # Copy Spanish SRT
+                  esp_source_parts = spanish_location.replace("s3://", "").split("/")
+                  esp_source_bucket = esp_source_parts[0]
+                  esp_source_key = "/".join(esp_source_parts[1:])
+
+                  esp_destination_key = str(Path(original_key).with_suffix('.es.srt'))
+
+                  print(f"DEBUG: Copying Spanish SRT from s3://{esp_source_bucket}/{esp_source_key}")
+                  print(f"DEBUG: Copying to s3://{original_bucket}/{esp_destination_key}")
+
+                  s3.copy_object(
+                      CopySource={
+                          'Bucket': esp_source_bucket,
+                          'Key': esp_source_key
+                      },
+                      Bucket=original_bucket,
+                      Key=esp_destination_key
+                  )
+
+                  print(f"DEBUG: Successfully copied both files")
+
+                  return {
+                      'Status': 'Success',
+                      'EnglishSource': f"s3://{eng_source_bucket}/{eng_source_key}",
+                      'EnglishDestination': f"s3://{original_bucket}/{eng_destination_key}",
+                      'SpanishSource': f"s3://{esp_source_bucket}/{esp_source_key}",
+                      'SpanishDestination': f"s3://{original_bucket}/{esp_destination_key}"
+                  }
+
+              except ClientError as e:
+                  error_message = f"Error copying SRT: {e.response['Error']['Message']}"
+                  print(f"DEBUG: {error_message}")
+                  raise
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  print(f"DEBUG: {error_message}")
+                  raise
+  # A2I Flow Definition Custom Resource
+  A2IFlowDefinitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-a2i-flow-definition
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import json
+          import urllib.request
+          from botocore.exceptions import ClientError
+
+          # CloudFormation response function
+          def send_response(event, context, response_status, response_data):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f"See details in CloudWatch Log Stream: {context.log_stream_name}",
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+
+              response_body_str = json.dumps(response_body)
+              print(f"Response body: {response_body_str}")
+
+              headers = {
+                  'Content-Type': '',
+                  'Content-Length': str(len(response_body_str))
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url=event['ResponseURL'],
+                      data=response_body_str.encode('utf-8'),
+                      headers=headers,
+                      method='PUT'
+                  )
+                  response = urllib.request.urlopen(req)
+                  print(f"Status code: {response.getcode()}")
+                  print(f"Status message: {response.msg}")
+                  return True
+              except Exception as e:
+                  print(f"Error sending response: {str(e)}")
+                  return False
+
+          def handler(event, context):
+              sagemaker = boto3.client('sagemaker')
+
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  if event['RequestType'] in ['Create', 'Update']:
+                      print("Starting Flow Definition creation/update process")
+
+                      required_params = [
+                          'FlowDefinitionName', 'WorkteamArn', 'HumanTaskUiArn',
+                          'TaskTitle', 'TaskDescription', 'S3OutputPath', 'RoleArn'
+                      ]
+                      for param in required_params:
+                          if param not in event['ResourceProperties']:
+                              raise ValueError(f"Missing required parameter: {param}")
+
+                      try:
+                          print("Creating new Flow Definition with parameters:")
+                          print(f"FlowDefinitionName: {event['ResourceProperties']['FlowDefinitionName']}")
+                          print(f"WorkteamArn: {event['ResourceProperties']['WorkteamArn']}")
+                          print(f"HumanTaskUiArn: {event['ResourceProperties']['HumanTaskUiArn']}")
+                          print(f"S3OutputPath: {event['ResourceProperties']['S3OutputPath']}")
+                          print(f"RoleArn: {event['ResourceProperties']['RoleArn']}")
+
+                          response = sagemaker.create_flow_definition(
+                              FlowDefinitionName=event['ResourceProperties']['FlowDefinitionName'],
+                              HumanLoopConfig={
+                                  'WorkteamArn': event['ResourceProperties']['WorkteamArn'],
+                                  'HumanTaskUiArn': event['ResourceProperties']['HumanTaskUiArn'],
+                                  'TaskTitle': event['ResourceProperties']['TaskTitle'],
+                                  'TaskDescription': event['ResourceProperties']['TaskDescription'],
+                                  'TaskCount': int(event['ResourceProperties']['TaskCount']),
+                                  'TaskAvailabilityLifetimeInSeconds': int(event['ResourceProperties']['TaskAvailabilityLifetimeInSeconds'])
+                              },
+                              OutputConfig={
+                                  'S3OutputPath': event['ResourceProperties']['S3OutputPath']
+                              },
+                              RoleArn=event['ResourceProperties']['RoleArn']
+                          )
+
+                          print(f"Flow Definition creation response: {json.dumps(response, default=str)}")
+
+                          time.sleep(5)
+
+                          max_attempts = 6
+                          for attempt in range(max_attempts):
+                              try:
+                                  verify_response = sagemaker.describe_flow_definition(
+                                      FlowDefinitionName=event['ResourceProperties']['FlowDefinitionName']
+                                  )
+                                  print(f"Flow Definition verified: {json.dumps(verify_response, default=str)}")
+
+                                  send_response(event, context, 'SUCCESS', {
+                                      'Arn': response['FlowDefinitionArn'],
+                                      'Name': event['ResourceProperties']['FlowDefinitionName']
+                                  })
+                                  return
+
+                              except sagemaker.exceptions.ResourceNotFound:
+                                  if attempt < max_attempts - 1:
+                                      print(f"Flow Definition not found yet, attempt {attempt + 1} of {max_attempts}")
+                                      time.sleep(5)
+                                      continue
+                                  raise
+
+                          raise Exception("Flow Definition creation could not be verified")
+
+                      except ClientError as e:
+                          print(f"ClientError creating Flow Definition: {e.response['Error']['Message']}")
+                          raise
+                      except Exception as e:
+                          print(f"Error creating Flow Definition: {str(e)}")
+                          raise
+
+                  elif event['RequestType'] == 'Delete':
+                      try:
+                          print(f"Attempting to delete Flow Definition: {event['ResourceProperties']['FlowDefinitionName']}")
+                          sagemaker.delete_flow_definition(
+                              FlowDefinitionName=event['ResourceProperties']['FlowDefinitionName']
+                          )
+                          print("Flow Definition deletion initiated")
+                          send_response(event, context, 'SUCCESS', {})
+                      except sagemaker.exceptions.ResourceNotFound:
+                          print(f"Flow Definition not found, skipping deletion")
+                          send_response(event, context, 'SUCCESS', {})
+                      except ClientError as e:
+                          print(f"ClientError during deletion: {e.response['Error']['Message']}")
+                          raise
+                      except Exception as e:
+                          print(f"Error during deletion: {str(e)}")
+                          raise
+
+              except Exception as e:
+                  error_message = f"Error in handler: {str(e)}"
+                  print(error_message)
+                  send_response(event, context, 'FAILED', {
+                      'Error': error_message
+                  })
+      Runtime: python3.11
+      Timeout: 300
+
+  A2IFlowDefinitionCustomResource:
+    Type: Custom::A2IFlowDefinition
+    Properties:
+      ServiceToken: !GetAtt A2IFlowDefinitionLambda.Arn
+      FlowDefinitionName: !Sub ${EnvironmentName}-a2i-flow
+      WorkteamArn: !Ref WorkteamArn
+      HumanTaskUiArn: !Ref HumanTaskUiArn
+      TaskTitle: Video Transcription Review
+      TaskDescription: Review and correct video transcription
+      TaskCount: 1
+      TaskAvailabilityLifetimeInSeconds: 3600
+      S3OutputPath: !Sub s3://${OutputBucket}/a2i-output/
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+  # S3 Event Notification Custom Resource
+  S3EventNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-s3-event-notification
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib.request
+          from botocore.exceptions import ClientError
+
+          # CloudFormation response function
+          def send_response(event, context, response_status, response_data):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f"See details in CloudWatch Log Stream: {context.log_stream_name}",
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+
+              response_body_str = json.dumps(response_body)
+              print(f"Response body: {response_body_str}")
+
+              headers = {
+                  'Content-Type': '',
+                  'Content-Length': str(len(response_body_str))
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url=event['ResponseURL'],
+                      data=response_body_str.encode('utf-8'),
+                      headers=headers,
+                      method='PUT'
+                  )
+                  response = urllib.request.urlopen(req)
+                  print(f"Status code: {response.getcode()}")
+                  print(f"Status message: {response.msg}")
+                  return True
+              except Exception as e:
+                  print(f"Error sending response: {str(e)}")
+                  return False
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              lambda_client = boto3.client('lambda')
+
+              try:
+                  print(f"Received event: {event}")
+                  if event['RequestType'] in ['Create', 'Update']:
+                      try:
+                          lambda_client.add_permission(
+                              FunctionName=event['ResourceProperties']['LambdaFunctionArn'],
+                              StatementId='AllowS3Invoke',
+                              Action='lambda:InvokeFunction',
+                              Principal='s3.amazonaws.com',
+                              SourceArn=f"arn:aws:s3:::{event['ResourceProperties']['BucketName']}"
+                          )
+                      except lambda_client.exceptions.ResourceConflictException:
+                          print("Permission already exists, skipping add_permission")
+
+                      s3.put_bucket_notification_configuration(
+                          Bucket=event['ResourceProperties']['BucketName'],
+                          NotificationConfiguration={
+                              'LambdaFunctionConfigurations': [
+                                  {
+                                      'LambdaFunctionArn': event['ResourceProperties']['LambdaFunctionArn'],
+                                      'Events': ['s3:ObjectCreated:*'],
+                                      'Filter': {
+                                          'Key': {
+                                              'FilterRules': [
+                                                  {
+                                                      'Name': 'suffix',
+                                                      'Value': '.mp4'
+                                                  }
+                                              ]
+                                          }
+                                      }
+                                  },
+                                  {
+                                      'LambdaFunctionArn': event['ResourceProperties']['LambdaFunctionArn'],
+                                      'Events': ['s3:ObjectCreated:*'],
+                                      'Filter': {
+                                          'Key': {
+                                              'FilterRules': [
+                                                  {
+                                                      'Name': 'suffix',
+                                                      'Value': '.mov'
+                                                  }
+                                              ]
+                                          }
+                                      }
+                                  },
+                                  {
+                                      'LambdaFunctionArn': event['ResourceProperties']['LambdaFunctionArn'],
+                                      'Events': ['s3:ObjectCreated:*'],
+                                      'Filter': {
+                                          'Key': {
+                                              'FilterRules': [
+                                                  {
+                                                      'Name': 'suffix',
+                                                      'Value': '.m4a'
+                                                  }
+                                              ]
+                                          }
+                                      }
+                                  },
+                                  {
+                                      'LambdaFunctionArn': event['ResourceProperties']['LambdaFunctionArn'],
+                                      'Events': ['s3:ObjectCreated:*'],
+                                      'Filter': {
+                                          'Key': {
+                                              'FilterRules': [
+                                                  {
+                                                      'Name': 'suffix',
+                                                      'Value': '.webm'
+                                                  }
+                                              ]
+                                          }
+                                      }
+                                  }
+                              ]
+                          }
+                      )
+                      send_response(event, context, 'SUCCESS', {})
+                  elif event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=event['ResourceProperties']['BucketName'],
+                          NotificationConfiguration={}
+                      )
+
+                      try:
+                          lambda_client.remove_permission(
+                              FunctionName=event['ResourceProperties']['LambdaFunctionArn'],
+                              StatementId='AllowS3Invoke'
+                          )
+                      except lambda_client.exceptions.ResourceNotFoundException:
+                          print("Permission not found, skipping remove_permission")
+
+                      send_response(event, context, 'SUCCESS', {})
+              except ClientError as e:
+                  print(f"ClientError: {e.response['Error']['Message']}")
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+  TriggerStepFunctionsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-trigger-step-functions
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref TranscriptionWorkflow
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              try:
+                  client = boto3.client('stepfunctions')
+                  print(f"Received event: {json.dumps(event)}")
+
+                  state_machine_arn = os.environ['STATE_MACHINE_ARN']
+
+                  response = client.start_execution(
+                      stateMachineArn=state_machine_arn,
+                      input=json.dumps(event)
+                  )
+                  print(f"Started execution: {response['executionArn']}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Step Functions workflow started')
+                  }
+              except ClientError as e:
+                  print(f"ClientError: {e.response['Error']['Message']}")
+                  raise
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  raise
+
+  S3EventNotificationCustomResource:
+    Type: Custom::S3EventNotification
+    DependsOn:
+      - TriggerStepFunctionsLambda
+      - InputBucket
+    Properties:
+      ServiceToken: !GetAtt S3EventNotificationLambda.Arn
+      BucketName: !Ref InputBucket
+      BucketArn: !GetAtt InputBucket.Arn
+      LambdaFunctionArn: !GetAtt TriggerStepFunctionsLambda.Arn
+  NotifyErrorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-notify-error
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+      Code:
+        ZipFile: |
+          from typing import Dict, Any
+          import boto3
+          import json
+          import os
+          from datetime import datetime, UTC
+          from botocore.exceptions import ClientError
+
+          def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              print(f"DEBUG: Received error event: {json.dumps(event, indent=2)}")
+
+              sns = boto3.client('sns')
+
+              try:
+                  error_details = {
+                      'timestamp': datetime.now(UTC).isoformat(),
+                      'executionName': event.get('executionName', 'Unknown'),
+                      'lastState': event.get('lastState', 'Unknown'),
+                      'error': event.get('error', {}),
+                      'workflowInput': event.get('workflowInput', {})
+                  }
+
+                  error_message = json.dumps(error_details, indent=2)
+                  print(f"DEBUG: Formatted error message:\\n{error_message}")
+
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Workflow Error in {error_details['lastState']}",
+                      Message=error_message
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'error': error_details
+                  }
+              except ClientError as e:
+                  print(f"DEBUG: Error in NotifyErrorLambda: {e.response['Error']['Message']}")
+                  raise
+              except Exception as e:
+                  print(f"DEBUG: Unexpected error in NotifyErrorLambda: {str(e)}")
+                  raise
+      Runtime: python3.11
+      Timeout: 30
+
+  # Step Functions State Machine
+  TranscriptionWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - StartTranscribeJobLambda
+      - CheckTranscriptionStatusLambda
+      - EvaluateConfidenceScoreLambda
+      - CreateHumanLoopLambda
+      - CheckA2ITaskStatusLambda
+      - WriteFinalOutputLambda
+      - TranslateToSpanishLambda
+      - CopyReviewedSRTLambda
+      - A2IFlowDefinitionCustomResource
+      - NotifyErrorLambda
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A2I Video Transcription Workflow with AWS Translate",
+            "StartAt": "Start Transcribe Job",
+            "States": {
+              "Start Transcribe Job": {
+                "Type": "Task",
+                "Resource": "${StartTranscribeJobLambda.Arn}",
+                "Parameters": {
+                  "executionName.$": "$$.Execution.Name",
+                  "detail": {
+                    "bucket": {
+                      "name.$": "$.Records[0].s3.bucket.name"
+                    },
+                    "object": {
+                      "key.$": "$.Records[0].s3.object.key"
+                    }
+                  },
+                  "outputBucket": "${OutputBucket}"
+                },
+                "ResultPath": "$.jobInfo",
+                "Next": "Wait For Transcription",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Wait For Transcription": {
+                "Type": "Wait",
+                "Seconds": 150,
+                "Next": "Check Transcription Status"
+              },
+              "Check Transcription Status": {
+                "Type": "Task",
+                "Resource": "${CheckTranscriptionStatusLambda.Arn}",
+                "Parameters": {
+                  "TranscriptionJobName.$": "$.jobInfo.TranscriptionJobName"
+                },
+                "ResultPath": "$.TranscriptionStatus",
+                "Next": "Is Transcription Complete?",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Is Transcription Complete?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.TranscriptionStatus.Status",
+                    "StringEquals": "COMPLETED",
+                    "Next": "Evaluate Confidence Score"
+                  },
+                  {
+                    "Variable": "$.TranscriptionStatus.Status",
+                    "StringEquals": "FAILED",
+                    "Next": "Notify Error"
+                  }
+                ],
+                "Default": "Wait For Transcription"
+              },
+              "Evaluate Confidence Score": {
+                "Type": "Task",
+                "Resource": "${EvaluateConfidenceScoreLambda.Arn}",
+                "ResultPath": "$.ConfidenceScore",
+                "Next": "Confidence Score Check",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Confidence Score Check": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.ConfidenceScore.ConfidenceScore",
+                    "NumericLessThan": ${ConfidenceThreshold},
+                    "Next": "Start A2I Human Review"
+                  }
+                ],
+                "Default": "Write Final Output"
+              },
+              "Start A2I Human Review": {
+                "Type": "Task",
+                "Resource": "${CreateHumanLoopLambda.Arn}",
+                "Parameters": {
+                  "executionName.$": "$$.Execution.Name",
+                  "flowDefinitionArn": "${FlowDefArn}",
+                  "payload": {
+                    "outputBucket": "${OutputBucket}",
+                    "detail.$": "$.Records[0].s3",
+                    "executionName.$": "$$.Execution.Name"
+                  }
+                },
+                "ResultPath": "$.HumanLoop",
+                "Next": "Wait For Human Review",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Wait For Human Review": {
+                "Type": "Wait",
+                "Seconds": 60,
+                "Next": "Check Human Review Status"
+              },
+              "Check Human Review Status": {
+                "Type": "Task",
+                "Resource": "${CheckA2ITaskStatusLambda.Arn}",
+                "Parameters": {
+                  "HumanLoopName.$": "$.HumanLoop.HumanLoopName"
+                },
+                "ResultPath": "$.HumanReviewStatus",
+                "Next": "Is Human Review Complete?",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Is Human Review Complete?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.HumanReviewStatus.Status",
+                    "StringEquals": "Completed",
+                    "Next": "Write Final Output"
+                  },
+                  {
+                    "Variable": "$.HumanReviewStatus.Status",
+                    "StringEquals": "Failed",
+                    "Next": "Notify Error"
+                  }
+                ],
+                "Default": "Wait For Human Review"
+              },
+              "Write Final Output": {
+                "Type": "Task",
+                "Resource": "${WriteFinalOutputLambda.Arn}",
+                "Parameters": {
+                  "executionName.$": "$$.Execution.Name",
+                  "OutputLocation.$": "$.HumanReviewStatus.OutputLocation"
+                },
+                "ResultPath": "$.WriteFinalOutput",
+                "Next": "Translate To Spanish",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Translate To Spanish": {
+                "Type": "Task",
+                "Resource": "${TranslateToSpanishLambda.Arn}",
+                "Parameters": {
+                  "ExecutionName.$": "$.WriteFinalOutput.ExecutionName",
+                  "OutputLocation.$": "$.WriteFinalOutput.OutputLocation"
+                },
+                "ResultPath": "$.SpanishTranslation",
+                "Next": "Copy To Input Location",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Copy To Input Location": {
+                "Type": "Task",
+                "Resource": "${CopyReviewedSRTLambda.Arn}",
+                "Parameters": {
+                  "OutputLocation.$": "$.WriteFinalOutput.OutputLocation",
+                  "SpanishLocation.$": "$.SpanishTranslation.SpanishLocation",
+                  "Records.$": "$.Records"
+                },
+                "End": true,
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Notify Error"
+                }]
+              },
+              "Notify Error": {
+                "Type": "Task",
+                "Resource": "${NotifyErrorLambda.Arn}",
+                "Parameters": {
+                  "error.$": "$.error",
+                  "executionName.$": "$$.Execution.Name",
+                  "lastState.$": "$$.State.Name",
+                  "workflowInput.$": "$"
+                },
+                "Next": "Workflow Failed"
+              },
+              "Workflow Failed": {
+                "Type": "Fail",
+                "Cause": "Workflow execution failed",
+                "Error": "WorkflowFailedError"
+              }
+            }
+          }
+        - StartTranscribeJobLambda: !GetAtt StartTranscribeJobLambda.Arn
+          CheckTranscriptionStatusLambda: !GetAtt CheckTranscriptionStatusLambda.Arn
+          EvaluateConfidenceScoreLambda: !GetAtt EvaluateConfidenceScoreLambda.Arn
+          CreateHumanLoopLambda: !GetAtt CreateHumanLoopLambda.Arn
+          CheckA2ITaskStatusLambda: !GetAtt CheckA2ITaskStatusLambda.Arn
+          WriteFinalOutputLambda: !GetAtt WriteFinalOutputLambda.Arn
+          TranslateToSpanishLambda: !GetAtt TranslateToSpanishLambda.Arn
+          CopyReviewedSRTLambda: !GetAtt CopyReviewedSRTLambda.Arn
+          NotifyErrorLambda: !GetAtt NotifyErrorLambda.Arn
+          FlowDefArn: !GetAtt A2IFlowDefinitionCustomResource.Arn
+          OutputBucket: !Ref OutputBucket
+          ConfidenceThreshold: !Ref ConfidenceThreshold
+
+# Outputs
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions State Machine
+    Value: !Ref TranscriptionWorkflow
+
+  InputBucketName:
+    Description: Name of the S3 bucket for input files
+    Value: !Ref InputBucket
+
+  OutputBucketName:
+    Description: Name of the S3 bucket for output files
+    Value: !Ref OutputBucket
+
+  FlowDefinitionArn:
+    Description: ARN of the A2I Flow Definition
+    Value: !GetAtt A2IFlowDefinitionCustomResource.Arn
